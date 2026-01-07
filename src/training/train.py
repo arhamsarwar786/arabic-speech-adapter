@@ -1,0 +1,487 @@
+"""
+Training script for Continuous Adapter
+
+Trains only the adapter while keeping ArTST and Jais frozen.
+"""
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import get_linear_schedule_with_warmup
+from pathlib import Path
+import yaml
+from tqdm import tqdm
+import wandb
+from typing import Optional
+import logging
+from datetime import datetime
+import traceback
+
+import sys
+sys.path.append(str(Path(__file__).parent.parent.parent))
+
+from src.models import ArabicSpeechPipeline
+from src.data import MultiDatasetLoader, SpeechTextCollator
+
+
+class AdapterTrainer:
+    """
+    Trainer for Continuous Adapter
+    
+    Handles:
+        - Training loop
+        - Checkpointing
+        - Logging
+        - Evaluation
+    """
+    
+    def __init__(
+        self,
+        config_path: str,
+        output_dir: str,
+        use_wandb: bool = False
+    ):
+        """
+        Args:
+            config_path: Path to training_config.yaml
+            output_dir: Directory for checkpoints and logs
+            use_wandb: Whether to use Weights & Biases
+        """
+        # Load config
+        with open(config_path, 'r') as f:
+            self.config = yaml.safe_load(f)
+        
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.use_wandb = use_wandb
+        
+        # Setup logging
+        self.logger = self._setup_logging()
+        
+        # Setup device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.logger.info(f"Using device: {self.device}")
+        print(f"Using device: {self.device}")
+        
+        # Initialize model
+        print("\n" + "="*60)
+        print("Initializing Model")
+        print("="*60)
+        self.model = self._build_model()
+        self.model.to(self.device)
+        
+        # Initialize data
+        print("\n" + "="*60)
+        print("Loading Data")
+        print("="*60)
+        self.train_loader, self.val_loader = self._build_dataloaders()
+        
+        # Initialize optimizer
+        print("\n" + "="*60)
+        print("Setting up Training")
+        print("="*60)
+        self.optimizer, self.scheduler = self._build_optimizer()
+        
+        # Mixed precision training
+        self.use_fp16 = self.config['training'].get('fp16', False)
+        self.scaler = torch.cuda.amp.GradScaler() if self.use_fp16 else None
+        
+        # Training state
+        self.global_step = 0
+        self.epoch = 0
+        self.best_val_loss = float('inf')
+        
+        # Initialize wandb
+        if self.use_wandb:
+            wandb.init(
+                project="arabic-speech-adapter",
+                config=self.config
+            )
+        
+        self.logger.info("="*60)
+        self.logger.info("Trainer initialized successfully")
+        self.logger.info(f"Output directory: {self.output_dir}")
+        self.logger.info(f"Config: {config_path}")
+        self.logger.info(f"FP16: {self.use_fp16}")
+        self.logger.info(f"WandB: {self.use_wandb}")
+        self.logger.info("="*60)
+        print("\n✓ Trainer initialized!")
+    
+    def _setup_logging(self):
+        """Setup file and console logging"""
+        log_dir = Path("experiments/logs")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = log_dir / f"training_{timestamp}.log"
+        
+        # Create logger
+        logger = logging.getLogger("AdapterTrainer")
+        logger.setLevel(logging.INFO)
+        
+        # File handler
+        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler.setLevel(logging.INFO)
+        file_formatter = logging.Formatter(
+            '%(asctime)s | %(levelname)s | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        file_handler.setFormatter(file_formatter)
+        
+        # Console handler (only errors)
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.ERROR)
+        console_formatter = logging.Formatter('%(levelname)s: %(message)s')
+        console_handler.setFormatter(console_formatter)
+        
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
+        
+        logger.info("="*60)
+        logger.info("TRAINING SESSION STARTED")
+        logger.info(f"Log file: {log_file}")
+        logger.info(f"Timestamp: {timestamp}")
+        logger.info("="*60)
+        
+        print(f"📝 Logging to: {log_file}")
+        
+        return logger
+    
+    def _build_model(self):
+        """Build the pipeline"""
+        model_cfg = self.config['model']
+        
+        adapter_config = {
+            'speech_dim': model_cfg['artst']['output_dim'],
+            'hidden_dim': model_cfg['jais']['hidden_dim'],
+            'num_prefix_tokens': model_cfg['adapter']['num_prefix_tokens'],
+            'num_attention_heads': model_cfg['adapter']['num_attention_heads'],
+            'intermediate_dim': model_cfg['adapter']['intermediate_dim'],
+            'dropout': model_cfg['adapter']['dropout']
+        }
+        
+        model = ArabicSpeechPipeline(
+            artst_model=model_cfg['artst']['model_name'],
+            jais_model=model_cfg['jais']['model_name'],
+            adapter_config=adapter_config,
+            cache_dir=model_cfg.get('cache_dir', './cache'),
+            use_8bit_jais=model_cfg['jais'].get('use_8bit', False)
+        )
+        
+        return model
+    
+    def _build_dataloaders(self):
+        """Build train and validation dataloaders"""
+        data_cfg = self.config['data']
+        train_cfg = self.config['training']
+        
+        # Multi-dataset loader
+        multi_loader = MultiDatasetLoader(
+            data_root=data_cfg['data_root'],
+            datasets=data_cfg['dataset_weights'],
+            split='train',
+            sample_rate=16000,
+            max_audio_length=data_cfg.get('max_audio_length')
+        )
+        
+        train_dataset, train_sampler = multi_loader.get_combined_dataset()
+        
+        # Validation dataset (just use commonvoice)
+        from src.data import ArabicSpeechDataset
+        val_dataset = ArabicSpeechDataset(
+            data_root=data_cfg['data_root'],
+            dataset_name='commonvoice',
+            split='validation',
+            sample_rate=16000,
+            max_audio_length=data_cfg.get('max_audio_length')
+        )
+        
+        # Collator
+        collator = SpeechTextCollator(
+            tokenizer_name=self.config['model']['jais']['model_name'],
+            max_audio_length=data_cfg.get('max_audio_length', 480000),
+            max_text_length=data_cfg.get('max_text_length', 512)
+        )
+        
+        # Dataloaders
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=train_cfg['batch_size'],
+            sampler=train_sampler,
+            collate_fn=collator,
+            num_workers=train_cfg.get('num_workers', 4),
+            pin_memory=True
+        )
+        
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=train_cfg['batch_size'],
+            shuffle=False,
+            collate_fn=collator,
+            num_workers=train_cfg.get('num_workers', 4),
+            pin_memory=True
+        )
+        
+        return train_loader, val_loader
+    
+    def _build_optimizer(self):
+        """Build optimizer and scheduler"""
+        train_cfg = self.config['training']
+        
+        # Only optimize adapter parameters
+        optimizer = AdamW(
+            self.model.adapter.parameters(),
+            lr=train_cfg['learning_rate'],
+            weight_decay=train_cfg['weight_decay']
+        )
+        
+        # Learning rate scheduler
+        total_steps = train_cfg['max_steps']
+        warmup_steps = train_cfg['warmup_steps']
+        
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps
+        )
+        
+        print(f"Optimizer: AdamW (lr={train_cfg['learning_rate']})")
+        print(f"Scheduler: Linear warmup ({warmup_steps} steps) + decay")
+        print(f"Total steps: {total_steps}")
+        
+        return optimizer, scheduler
+    
+    def train(self):
+        """Main training loop"""
+        train_cfg = self.config['training']
+        max_steps = train_cfg['max_steps']
+        
+        self.logger.info("="*60)
+        self.logger.info("STARTING TRAINING")
+        self.logger.info(f"Max steps: {max_steps}")
+        self.logger.info(f"Batch size: {train_cfg['batch_size']}")
+        self.logger.info(f"Learning rate: {train_cfg['learning_rate']}")
+        self.logger.info(f"FP16 enabled: {self.use_fp16}")
+        self.logger.info("="*60)
+        
+        print("\n" + "="*60)
+        print("Starting Training")
+        print("="*60)
+        
+        self.model.train()
+        
+        pbar = tqdm(total=max_steps, desc="Training")
+        
+        while self.global_step < max_steps:
+            for batch in self.train_loader:
+                try:
+                    # Move to device
+                    audio = batch['audio'].to(self.device)
+                    labels = batch['labels'].to(self.device)
+                    audio_mask = batch.get('audio_attention_mask')
+                    if audio_mask is not None:
+                        audio_mask = audio_mask.to(self.device)
+                    
+                    # Forward pass with mixed precision
+                    if self.use_fp16:
+                        with torch.cuda.amp.autocast():
+                            outputs = self.model(
+                                audio=audio,
+                                audio_attention_mask=audio_mask,
+                                labels=labels
+                            )
+                            loss = outputs.loss / train_cfg['gradient_accumulation_steps']
+                        
+                        # Backward with scaler
+                        self.scaler.scale(loss).backward()
+                    else:
+                        outputs = self.model(
+                            audio=audio,
+                            audio_attention_mask=audio_mask,
+                            labels=labels
+                        )
+                        loss = outputs.loss / train_cfg['gradient_accumulation_steps']
+                        loss.backward()
+                    
+                    # Update weights
+                    if (self.global_step + 1) % train_cfg['gradient_accumulation_steps'] == 0:
+                        if self.use_fp16:
+                            # Unscale before clipping
+                            self.scaler.unscale_(self.optimizer)
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.adapter.parameters(),
+                                train_cfg['max_grad_norm']
+                            )
+                            self.scaler.step(self.optimizer)
+                            self.scaler.update()
+                        else:
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.adapter.parameters(),
+                                train_cfg['max_grad_norm']
+                            )
+                            self.optimizer.step()
+                        
+                        self.scheduler.step()
+                        self.optimizer.zero_grad()
+                    
+                    # Logging
+                    if self.global_step % train_cfg['logging_steps'] == 0:
+                        lr = self.scheduler.get_last_lr()[0]
+                        pbar.set_postfix({
+                            'loss': f"{loss.item():.4f}",
+                            'lr': f"{lr:.2e}"
+                        })
+                        
+                        self.logger.info(
+                            f"Step {self.global_step}/{max_steps} | "
+                            f"Loss: {loss.item():.4f} | "
+                            f"LR: {lr:.2e}"
+                        )
+                        
+                        if self.use_wandb:
+                            wandb.log({
+                                'train/loss': loss.item(),
+                                'train/lr': lr,
+                                'train/step': self.global_step
+                            })
+                    
+                    # Validation
+                    if self.global_step % train_cfg['eval_steps'] == 0:
+                        val_loss = self.validate()
+                        
+                        # Save best model
+                        if val_loss < self.best_val_loss:
+                            self.logger.info(
+                                f"New best validation loss: {val_loss:.4f} "
+                                f"(previous: {self.best_val_loss:.4f})"
+                            )
+                            self.best_val_loss = val_loss
+                            self.save_checkpoint('best_adapter.pt')
+                        
+                        self.model.train()
+                    
+                    # Checkpointing
+                    if self.global_step % train_cfg['save_steps'] == 0:
+                        self.save_checkpoint(f'adapter_step_{self.global_step}.pt')
+                    
+                    self.global_step += 1
+                    pbar.update(1)
+                    
+                    if self.global_step >= max_steps:
+                        break
+                
+                except Exception as e:
+                    self.logger.error("="*60)
+                    self.logger.error(f"ERROR at step {self.global_step}")
+                    self.logger.error(f"Exception: {str(e)}")
+                    self.logger.error("Traceback:")
+                    self.logger.error(traceback.format_exc())
+                    self.logger.error("="*60)
+                    
+                    # Save emergency checkpoint
+                    emergency_path = self.output_dir / f"emergency_step_{self.global_step}.pt"
+                    try:
+                        self.model.save_adapter(str(emergency_path))
+                        self.logger.info(f"Emergency checkpoint saved: {emergency_path}")
+                    except:
+                        self.logger.error("Failed to save emergency checkpoint")
+                    
+                    raise
+            
+            self.epoch += 1
+            self.logger.info(f"Completed epoch {self.epoch}")
+        
+        pbar.close()
+        
+        self.logger.info("="*60)
+        self.logger.info("TRAINING COMPLETED")
+        self.logger.info(f"Total steps: {self.global_step}")
+        self.logger.info(f"Total epochs: {self.epoch}")
+        self.logger.info(f"Best validation loss: {self.best_val_loss:.4f}")
+        self.logger.info("="*60)
+        
+        print("\n✓ Training complete!")
+        
+        # Save final model
+        self.save_checkpoint('final_adapter.pt')
+    
+    @torch.no_grad()
+    def validate(self):
+        """Run validation"""
+        self.model.eval()
+        
+        total_loss = 0
+        num_batches = 0
+        
+        for batch in tqdm(self.val_loader, desc="Validation", leave=False):
+            audio = batch['audio'].to(self.device)
+            labels = batch['labels'].to(self.device)
+            audio_mask = batch.get('audio_attention_mask')
+            if audio_mask is not None:
+                audio_mask = audio_mask.to(self.device)
+            
+            outputs = self.model(
+                audio=audio,
+                audio_attention_mask=audio_mask,
+                labels=labels
+            )
+            
+            total_loss += outputs.loss.item()
+            num_batches += 1
+        
+        avg_loss = total_loss / num_batches
+        
+        print(f"\n  Validation Loss: {avg_loss:.4f}")
+        
+        if self.use_wandb:
+            wandb.log({
+                'val/loss': avg_loss,
+                'val/step': self.global_step
+            })
+        
+        return avg_loss
+    
+    def save_checkpoint(self, filename: str):
+        """Save checkpoint"""
+        path = self.output_dir / filename
+        self.model.save_adapter(str(path))
+        self.logger.info(f"Checkpoint saved: {path}")
+        print(f"  ✓ Checkpoint saved: {filename}")
+
+
+# Main entry point
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--config',
+        type=str,
+        default='configs/training_config.yaml',
+        help='Path to config file'
+    )
+    parser.add_argument(
+        '--output_dir',
+        type=str,
+        default='checkpoints',
+        help='Output directory'
+    )
+    parser.add_argument(
+        '--use_wandb',
+        action='store_true',
+        help='Use Weights & Biases logging'
+    )
+    
+    args = parser.parse_args()
+    
+    # Create trainer
+    trainer = AdapterTrainer(
+        config_path=args.config,
+        output_dir=args.output_dir,
+        use_wandb=args.use_wandb
+    )
+    
+    # Train
+    trainer.train()

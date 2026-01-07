@@ -1,0 +1,104 @@
+# Configuration for Continuous Adapter Training
+
+# Model Configuration
+model:
+  # ArTST Encoder (Frozen)
+  artst:
+    model_name: "MBZUAI/artst_asr_v2"
+    output_dim: 768
+    freeze: true
+  
+  # Continuous Adapter (Trainable)
+  adapter:
+    speech_dim: 768           # Must match ArTST output
+    hidden_dim: 4096          # Must match Jais hidden size
+    num_prefix_tokens: 32     # Number of soft prompt tokens
+    num_attention_heads: 8
+    intermediate_dim: 8192    # MLP intermediate size
+    dropout: 0.1
+  
+  # Jais Decoder (Frozen)
+  jais:
+    model_name: "inceptionai/jais-13b-chat"
+    hidden_dim: 4096
+    freeze: true
+    use_8bit: false           # Full precision with 40-100GB GPU
+  
+  cache_dir: "./cache"        # Cache for downloaded models
+
+# Training Configuration
+training:
+  # Data
+  batch_size: 16              # Optimized for 40-100GB GPU
+  num_workers: 8              # More workers for faster data loading
+  max_audio_length: 30        # seconds
+  
+  # Optimization
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  warmup_steps: 1000
+  max_steps: 50000
+  gradient_accumulation: 4
+  
+  # Scheduler
+  scheduler: "cosine"
+  num_epochs: 10
+  
+  # Checkpointing
+  save_every: 1000
+  eval_every: 500
+  keep_best: 3
+  
+  # Mixed Precision
+  fp16: true
+  
+# Dataset Configuration
+data:
+  train_datasets:
+    - name: "commonvoice"
+      path: "data/raw/commonvoice_ar"
+      weight: 0.4
+    - name: "qasr"
+      path: "data/raw/qasr"
+      weight: 0.2
+    - name: "mtedx"
+      path: "data/raw/mtedx"
+      weight: 0.3
+    - name: "covost2"
+      path: "data/raw/covost2"
+      weight: 0.1
+  
+  val_split: 0.05
+  test_split: 0.05
+  
+  # Preprocessing
+  sample_rate: 16000
+  normalize_audio: true
+  augmentation: true
+
+# Evaluation Configuration
+evaluation:
+  metrics:
+    - wer      # Word Error Rate
+    - cer      # Character Error Rate
+    - bleu     # Translation quality
+    - semantic # Semantic similarity
+  
+  generation:
+    max_new_tokens: 128
+    temperature: 0.7
+    top_p: 0.9
+    do_sample: true
+
+# Hardware Configuration
+hardware:
+  device: "cuda"
+  gpu_ids: [0]
+  distributed: false
+  
+# Paths
+paths:
+  data_dir: "data"
+  checkpoint_dir: "checkpoints"
+  log_dir: "experiments/logs"
+  cache_dir: "cache"

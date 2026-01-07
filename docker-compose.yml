@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  arabic-speech-training:
+    build: .
+    image: arabic-speech-adapter:latest
+    container_name: arabic-speech-adapter
+    
+    # GPU support
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    
+    # Or use runtime (older Docker versions)
+    # runtime: nvidia
+    
+    volumes:
+      # Mount code for development
+      - ./src:/workspace/src
+      - ./configs:/workspace/configs
+      - ./scripts:/workspace/scripts
+      
+      # Mount data directories (persistent)
+      - ./data:/workspace/data
+      - ./cache:/workspace/cache
+      - ./checkpoints:/workspace/checkpoints
+      - ./experiments:/workspace/experiments
+      
+      # Mount .env
+      - ./.env:/workspace/.env
+    
+    working_dir: /workspace
+    
+    # Keep container running
+    stdin_open: true
+    tty: true
+    
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - TRANSFORMERS_CACHE=/workspace/cache
+      - HF_HOME=/workspace/cache
+    
+    command: bash
+
+  # Optional: Quick test service (no GPU needed)
+  test:
+    build: .
+    image: arabic-speech-adapter:latest
+    container_name: arabic-speech-test
+    
+    volumes:
+      - ./src:/workspace/src
+      - ./configs:/workspace/configs
+    
+    working_dir: /workspace
+    
+    command: python -c "import torch; from src.models import ContinuousAdapter; print('✅ Imports OK')"
