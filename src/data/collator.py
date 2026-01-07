@@ -31,7 +31,8 @@ class SpeechTextCollator:
         """
         self.tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name,
-            trust_remote_code=True
+            trust_remote_code=True,
+            token=True  # Use token from huggingface-cli login
         )
         
         if self.tokenizer.pad_token is None:

@@ -34,7 +34,8 @@ class JaisDecoder(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name,
             cache_dir=cache_dir,
-            trust_remote_code=True
+            trust_remote_code=True,
+            token=True  # Use token from huggingface-cli login
         )
         
         # Set pad token if not exist
@@ -45,7 +46,8 @@ class JaisDecoder(nn.Module):
         load_kwargs = {
             "cache_dir": cache_dir,
             "trust_remote_code": True,
-            "torch_dtype": torch.float16 if use_8bit else torch.float32
+            "torch_dtype": torch.float16 if use_8bit else torch.float32,
+            "token": True  # Use token from huggingface-cli login
         }
         
         if use_8bit:
