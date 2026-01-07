@@ -279,6 +279,46 @@ training:
 
 ---
 
+## 🎯 Interactive Inference (NEW!)
+
+After training, launch the Gradio web interface for interactive testing:
+
+### Launch Gradio Demo
+
+```bash
+# Basic usage (local access only)
+bash scripts/6_launch_gradio.sh experiments/best_model/adapter_checkpoint.pt
+
+# Public share link (for remote servers)
+bash scripts/6_launch_gradio.sh experiments/best_model/adapter_checkpoint.pt --share
+
+# Custom port with authentication
+bash scripts/6_launch_gradio.sh experiments/best_model/adapter_checkpoint.pt \
+    --port 8080 \
+    --auth admin secretpass123
+```
+
+**Gradio Features:**
+- 🎤 **Microphone Recording**: Record directly from your mic
+- 📁 **File Upload**: Upload .wav, .mp3, .flac files
+- ⚙️ **Live Settings**: Adjust temperature, length, sampling on-the-fly
+- 📝 **Prompt Support**: Guide the LLM with custom prompts
+- 📊 **Real-time Status**: See processing time and statistics
+- 🔒 **Optional Auth**: Secure with username/password
+
+### Batch Inference
+
+Process multiple files efficiently:
+
+```bash
+bash scripts/7_batch_inference.sh \
+    experiments/best_model/adapter_checkpoint.pt \
+    test_audios/ \
+    results/
+```
+
+---
+
 ## 📝 Usage Example
 
 ### Python API
